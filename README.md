@@ -22,6 +22,38 @@ python quick_test.py
 
 快速验证会覆盖模型、约束、年发电量、优化、经济性和图表生成，并在 `test_output/` 写入临时图片。该目录不会纳入版本控制。
 
+方向性椭圆间距的专项验证：
+
+```bash
+python test_directional_spacing.py
+```
+
+## 方向性间距约束
+
+默认使用径向（圆形）最小间距 `--min-spacing`（转子直径倍数）。场址审批沿主风向给出不同安全间距时，可启用方向性椭圆安全域：每对机组在随参考风向旋转的坐标系中，分别按顺风、横风倍数判断椭圆安全域
+
+$$\left(\frac{s_{\parallel}}{k_{\downarrow}D}\right)^2+
+\left(\frac{s_{\perp}}{k_{\times}D}\right)^2 \ge 1$$
+
+恰好在安全域边界上的机对判为合格，重合机组（零距离）始终判为违规。
+
+```bash
+python -m wind_farm_opt \
+  --directional-spacing \
+  --reference-direction 270 \
+  --downwind-multiple 7 \
+  --crosswind-multiple 3 \
+  --show-safety-zones \
+  --n-turbines 15 --output-dir output
+```
+
+- `--reference-direction`：参考风向（度，气象习惯：风的来向），椭圆长轴沿气流方向并随之旋转；
+- `--downwind-multiple` / `--crosswind-multiple`：顺风 / 横风安全间距倍数（转子直径倍数）；
+- `--show-safety-zones`：在布局图中绘制若干代表性机组的椭圆（方向性）或圆形（径向）安全域；
+- `--no-directional-spacing`：关闭新规则，强制回到径向圆形间距。
+
+规则网格、交错布局、间距修复、GA 与 PSO 都只生成满足该约束的布局；拥挤场地无法满足时会在有限次尝试后报错退出，不会返回违规结果。固定 `--seed` 后，方向性与径向两种模式均可重复。配置文件中对应字段为 `optimization.directional_spacing.{enabled,reference_direction,downwind_multiple,crosswind_multiple}`。
+
 ## 完整分析
 
 ```bash

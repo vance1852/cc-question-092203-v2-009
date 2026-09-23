@@ -3,6 +3,7 @@
 用于从JSON/YAML文件加载配置，或通过命令行参数构建配置。
 """
 
+import dataclasses
 import json
 from dataclasses import dataclass, field
 from typing import Optional, List
@@ -18,6 +19,34 @@ from .constraints.boundary import (
     create_hexagonal_boundary,
     create_irregular_boundary,
 )
+from .constraints.spacing import SpacingConstraint
+
+
+@dataclass
+class DirectionalSpacingConfig:
+    """方向性（椭圆）安全间距配置。
+
+    审批沿参考风向给出不同的顺风/横风安全间距。启用后每对机组在
+    随 ``reference_direction`` 旋转的坐标系中按自身转子直径判断
+    椭圆安全域；关闭（``enabled=False``）时继续使用径向圆形间距
+    ``OptimizationConfig.min_spacing_multiple``。
+
+    Attributes
+    ----------
+    enabled : bool
+        是否启用方向性间距规则。
+    reference_direction : float
+        参考风向（度，气象习惯：风的来向），椭圆长轴沿气流方向。
+    downwind_multiple : float
+        顺风方向安全间距倍数（相对转子直径）。
+    crosswind_multiple : float
+        横风方向安全间距倍数（相对转子直径）。
+    """
+
+    enabled: bool = False
+    reference_direction: float = 270.0
+    downwind_multiple: float = 7.0
+    crosswind_multiple: float = 3.0
 
 
 @dataclass
@@ -28,6 +57,9 @@ class OptimizationConfig:
     max_iterations: int = 80
     min_spacing_multiple: float = 5.0
     seed: Optional[int] = 42
+    directional_spacing: DirectionalSpacingConfig = field(
+        default_factory=DirectionalSpacingConfig
+    )
 
 
 @dataclass
@@ -37,6 +69,7 @@ class VisualizationConfig:
     save_plots: bool = True
     show_plots: bool = False
     plot_wake_heatmap: bool = True
+    show_safety_zones: bool = False
 
 
 @dataclass
@@ -81,7 +114,14 @@ class WindFarmConfig:
         with open(filepath, "r", encoding="utf-8") as f:
             data = json.load(f)
 
-        opt_config = OptimizationConfig(**data.get("optimization", {}))
+        opt_data = dict(data.get("optimization", {}))
+        directional_data = opt_data.pop("directional_spacing", {})
+        opt_config = OptimizationConfig(**opt_data)
+        if directional_data:
+            opt_config.directional_spacing = DirectionalSpacingConfig(
+                **directional_data
+            )
+
         vis_config = VisualizationConfig(**data.get("visualization", {}))
         econ_config = EconomicConfig(**data.get("economic", {}))
 
@@ -102,6 +142,10 @@ class WindFarmConfig:
 
     def to_json(self, filepath: str) -> None:
         """保存配置到JSON文件。"""
+        opt_dict = dict(self.optimization.__dict__)
+        opt_dict["directional_spacing"] = dataclasses.asdict(
+            self.optimization.directional_spacing
+        )
         data = {
             "n_turbines": self.n_turbines,
             "turbine_model": self.turbine_model,
@@ -112,12 +156,29 @@ class WindFarmConfig:
             "boundary_params": self.boundary_params,
             "wind_resource_type": self.wind_resource_type,
             "wind_resource_params": self.wind_resource_params,
-            "optimization": self.optimization.__dict__,
+            "optimization": opt_dict,
             "visualization": self.visualization.__dict__,
             "economic": self.economic.__dict__,
         }
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
+
+    def create_spacing_constraint(
+        self, rotor_diameters: np.ndarray
+    ) -> SpacingConstraint:
+        """根据配置创建机组间距约束（方向性椭圆或径向圆形）。"""
+        dsp = self.optimization.directional_spacing
+        if dsp.enabled:
+            return SpacingConstraint.directional(
+                rotor_diameters=rotor_diameters,
+                reference_direction=dsp.reference_direction,
+                downwind_multiple=dsp.downwind_multiple,
+                crosswind_multiple=dsp.crosswind_multiple,
+            )
+        return SpacingConstraint.radial(
+            rotor_diameters=rotor_diameters,
+            min_multiple=self.optimization.min_spacing_multiple,
+        )
 
     def create_turbines(self) -> list[Turbine]:
         """根据配置创建风机列表。"""

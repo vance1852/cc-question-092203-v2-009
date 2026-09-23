@@ -11,13 +11,79 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib import font_manager
-from matplotlib.patches import Polygon, Circle
+from matplotlib.patches import Polygon, Circle, Ellipse
 from matplotlib.colors import Normalize, LinearSegmentedColormap
 
 from ..constraints.boundary import SiteBoundary
+from ..constraints.spacing import SpacingConstraint
 from ..core.wind_resource import WindResource
 from ..farm.aep import FarmResult
 from ..optimization.ga import OptimizeResult
+
+
+def _add_safety_zones(
+    ax,
+    positions: np.ndarray,
+    rotor_diameters: np.ndarray,
+    constraint: SpacingConstraint,
+    representative: bool = True,
+) -> None:
+    """在布局图上绘制安全域。
+
+    Parameters
+    ----------
+    representative : bool
+        True 时只绘制若干代表性机组（中心 + 四角附近）的安全域，
+        避免机组较多时图形不可读；False 时绘制全部机组。
+    """
+    n = positions.shape[0]
+    if representative and n > 6:
+        center_idx = int(np.argmin(np.linalg.norm(positions - positions.mean(axis=0), axis=1)))
+        # 包围盒四角最近的机组。
+        x_min, x_max = positions[:, 0].min(), positions[:, 0].max()
+        y_min, y_max = positions[:, 1].min(), positions[:, 1].max()
+        corners = np.array([
+            [x_min, y_min], [x_max, y_min], [x_max, y_max], [x_min, y_max]
+        ])
+        idxs = {center_idx}
+        for corner in corners:
+            idxs.add(int(np.argmin(np.linalg.norm(positions - corner, axis=1))))
+        show_idx = sorted(idxs)
+    else:
+        show_idx = list(range(n))
+
+    # 椭圆方位角：世界坐标 x 轴逆时针转到顺风轴的角度（度）。
+    e_along = constraint.e_along
+    angle_deg = float(np.rad2deg(np.arctan2(e_along[1], e_along[0])))
+
+    for li, k in enumerate(show_idx):
+        a, b = constraint.semiaxes(float(rotor_diameters[k]))
+        zone_label = None
+        if li == 0:
+            zone_label = (
+                f"代表性安全域（顺风 {constraint.downwind_multiple:g}D / "
+                f"横风 {constraint.crosswind_multiple:g}D，"
+                f"参考风向 {constraint.reference_direction:.0f}°）"
+                if constraint.is_directional
+                else f"代表性安全域（{constraint.min_multiple:g}D 圆形）"
+            )
+        common = dict(
+            facecolor="none",
+            edgecolor="darkred",
+            linewidth=1.2,
+            linestyle="--",
+            alpha=0.8,
+            zorder=3,
+            label=zone_label,
+        )
+        if constraint.is_directional:
+            patch = Ellipse(
+                positions[k], width=2.0 * a, height=2.0 * b,
+                angle=angle_deg, **common,
+            )
+        else:
+            patch = Circle(positions[k], radius=a, **common)
+        ax.add_patch(patch)
 
 
 def set_chinese_font() -> None:
@@ -43,6 +109,8 @@ def plot_farm_layout(
     turbine_losses: Optional[np.ndarray] = None,
     turbine_names: Optional[list[str]] = None,
     wake_interactions: Optional[dict] = None,
+    spacing_constraint: Optional[SpacingConstraint] = None,
+    show_safety_zones: bool = False,
     title: str = "风电场机位布局",
     save_path: Optional[str] = None,
     show: bool = False,
@@ -63,6 +131,10 @@ def plot_farm_layout(
         风机名称/编号
     wake_interactions : Optional[dict]
         尾流相互作用信息，用于绘制尾流连线
+    spacing_constraint : Optional[SpacingConstraint]
+        间距约束，用于绘制安全域
+    show_safety_zones : bool
+        是否展示代表性安全域（方向性椭圆或径向圆）
     title : str
         图表标题
     save_path : Optional[str]
@@ -135,6 +207,12 @@ def plot_farm_layout(
                     alpha=min(0.8, intensity * 5),
                     linewidth=0.5 + intensity * 3,
                 )
+
+    if show_safety_zones and spacing_constraint is not None:
+        _add_safety_zones(
+            ax, positions, rotor_diameters, spacing_constraint,
+            representative=True,
+        )
 
     margin = 0.1
     x_range = boundary.x_max - boundary.x_min
