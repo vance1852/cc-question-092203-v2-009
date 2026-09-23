@@ -18,6 +18,7 @@ from .constraints.boundary import (
     create_hexagonal_boundary,
     create_irregular_boundary,
 )
+from .constraints.spacing import SpacingConstraint
 
 
 @dataclass
@@ -29,6 +30,13 @@ class OptimizationConfig:
     min_spacing_multiple: float = 5.0
     seed: Optional[int] = 42
 
+    # 方向性（椭圆）间距约束。directional_spacing 为 False 时继续使用
+    # 上面的径向最小间距 min_spacing_multiple。
+    directional_spacing: bool = False
+    spacing_reference_direction: float = 270.0
+    downwind_spacing_multiple: float = 7.0
+    crosswind_spacing_multiple: float = 3.0
+
 
 @dataclass
 class VisualizationConfig:
@@ -37,6 +45,7 @@ class VisualizationConfig:
     save_plots: bool = True
     show_plots: bool = False
     plot_wake_heatmap: bool = True
+    plot_safety_zones: bool = True
 
 
 @dataclass
@@ -123,6 +132,20 @@ class WindFarmConfig:
         """根据配置创建风机列表。"""
         turbine = create_default_turbine(self.turbine_model)
         return [turbine for _ in range(self.n_turbines)]
+
+    def create_spacing_constraint(
+        self, rotor_diameters: np.ndarray
+    ) -> SpacingConstraint:
+        """根据配置创建间距约束（方向性椭圆域或径向圆域）。"""
+        opt = self.optimization
+        return SpacingConstraint(
+            rotor_diameters,
+            directional=opt.directional_spacing,
+            reference_direction=opt.spacing_reference_direction,
+            downwind_multiple=opt.downwind_spacing_multiple,
+            crosswind_multiple=opt.crosswind_spacing_multiple,
+            min_spacing_multiple=opt.min_spacing_multiple,
+        )
 
     def create_wake_model(self) -> WakeModel:
         """根据配置创建尾流模型。"""

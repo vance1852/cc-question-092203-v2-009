@@ -7,9 +7,8 @@ import numpy as np
 
 from ..constraints.boundary import SiteBoundary
 from ..constraints.spacing import (
-    check_min_spacing,
-    compute_min_spacing_from_diameters,
-    enforce_min_spacing,
+    SpacingConstraint,
+    SpacingFeasibilityError,
 )
 
 
@@ -34,7 +33,8 @@ class GAConfig:
     tournament_size : int
         锦标赛选择的规模
     min_spacing_multiple : float
-        最小间距倍数（相对于转子直径）
+        径向最小间距倍数（相对于转子直径）；当优化器收到方向性
+        SpacingConstraint 时该值不再参与判定
     penalty_factor : float
         约束违反惩罚因子
     seed : Optional[int]
@@ -98,6 +98,7 @@ class GeneticAlgorithm:
         boundary: SiteBoundary,
         fitness_fn: Callable[[np.ndarray], float],
         config: Optional[GAConfig] = None,
+        spacing_constraint: Optional[SpacingConstraint] = None,
     ) -> None:
         """
         Parameters
@@ -112,6 +113,8 @@ class GeneticAlgorithm:
             适应度函数，输入位置数组 (N_turb, 2)，返回净AEP
         config : Optional[GAConfig]
             算法配置参数
+        spacing_constraint : Optional[SpacingConstraint]
+            间距约束；为 None 时按 config.min_spacing_multiple 构造径向约束
         """
         self.n_turbines = n_turbines
         self.rotor_diameters = np.asarray(rotor_diameters, dtype=np.float64)
@@ -121,10 +124,17 @@ class GeneticAlgorithm:
 
         self.rng = np.random.default_rng(self.config.seed)
 
-        self.min_spacing = compute_min_spacing_from_diameters(
-            self.rotor_diameters,
-            self.config.min_spacing_multiple,
-        )
+        if spacing_constraint is not None:
+            self.spacing = spacing_constraint
+        else:
+            self.spacing = SpacingConstraint(
+                self.rotor_diameters,
+                directional=False,
+                min_spacing_multiple=self.config.min_spacing_multiple,
+            )
+
+        # 保留标量属性仅用于日志输出，判定一律走 self.spacing。
+        self.min_spacing = self.spacing.representative_semiaxes()[0]
 
         self.n_dim = n_turbines * 2
         self.x_range = boundary.x_max - boundary.x_min
@@ -151,7 +161,11 @@ class GeneticAlgorithm:
         return population
 
     def _generate_valid_layout(self) -> np.ndarray:
-        """生成一个满足约束的初始布局。"""
+        """生成一个满足约束的初始布局。
+
+        先尝试直接拒绝采样；失败则采样后调用间距修复。全部尝试均失败时
+        抛出 :class:`SpacingFeasibilityError`（有界退出）。
+        """
         max_attempts = 100
 
         for _ in range(max_attempts):
@@ -159,27 +173,46 @@ class GeneticAlgorithm:
                 positions = self.boundary.sample_random_points(
                     self.n_turbines, self.rng, max_attempts=50
                 )
-                valid, _ = check_min_spacing(positions, self.min_spacing)
-                if valid:
-                    return positions
             except RuntimeError:
                 continue
+
+            valid, _ = self.spacing.check(positions)
+            if valid:
+                return positions
 
             try:
-                positions = self.boundary.sample_random_points(
-                    self.n_turbines, self.rng, max_attempts=50
+                return self.spacing.enforce(
+                    positions, self.boundary, self.rng
                 )
-                positions = enforce_min_spacing(
-                    positions, self.min_spacing, self.boundary, self.rng
-                )
-                return positions
-            except RuntimeError:
+            except SpacingFeasibilityError:
                 continue
 
-        raise RuntimeError("无法生成满足约束的初始布局")
+        raise SpacingFeasibilityError("无法生成满足间距约束的初始布局")
+
+    def _repair_layout(self, positions: np.ndarray) -> np.ndarray:
+        """把任意布局修复为满足边界与间距约束的布局。
+
+        先投影回场地并推开违规机对；修复失败时退化为重新生成一个可行
+        布局。始终无法满足时抛出 :class:`SpacingFeasibilityError`。
+        """
+        positions = positions.copy()
+
+        for i in range(self.n_turbines):
+            if not self.boundary.contains_point(positions[i]):
+                positions[i] = self.boundary.project_to_boundary(positions[i])
+
+        valid, _ = self.spacing.check(positions)
+        inside = self.boundary.contains_all(positions).all()
+        if valid and inside:
+            return positions
+
+        try:
+            return self.spacing.enforce(positions, self.boundary, self.rng)
+        except SpacingFeasibilityError:
+            return self._generate_valid_layout()
 
     def _compute_penalty(self, positions_flat: np.ndarray) -> float:
-        """计算约束违反惩罚。"""
+        """计算约束违反惩罚（防御性；正常流程中个体均已被修复为可行）。"""
         positions = positions_flat.reshape(self.n_turbines, 2)
 
         penalty = 0.0
@@ -189,11 +222,10 @@ class GeneticAlgorithm:
             n_violations = np.sum(~inside)
             penalty += n_violations * self.config.penalty_factor
 
-        valid, violations = check_min_spacing(positions, self.min_spacing)
+        valid, violations = self.spacing.check(positions)
         if not valid:
-            for i, j in violations:
-                dist = np.linalg.norm(positions[i] - positions[j])
-                penalty += (self.min_spacing - dist) * self.config.penalty_factor
+            for v in violations:
+                penalty += (1.0 - v.normalized_ratio) * self.config.penalty_factor
 
         return penalty
 
@@ -255,24 +287,9 @@ class GeneticAlgorithm:
         return mutated
 
     def _repair(self, individual: np.ndarray) -> np.ndarray:
-        """修复违反约束的个体。"""
+        """修复违反约束的个体（成功后保证可行，否则抛 SpacingFeasibilityError）。"""
         positions = individual.reshape(self.n_turbines, 2)
-
-        for i in range(self.n_turbines):
-            if not self.boundary.contains_point(positions[i]):
-                positions[i] = self.boundary.project_to_boundary(positions[i])
-
-        valid, _ = check_min_spacing(positions, self.min_spacing)
-        inside = self.boundary.contains_all(positions).all()
-
-        if not (valid and inside):
-            try:
-                positions = enforce_min_spacing(
-                    positions, self.min_spacing, self.boundary, self.rng
-                )
-            except RuntimeError:
-                pass
-
+        positions = self._repair_layout(positions)
         return positions.flatten()
 
     def optimize(self, verbose: bool = True) -> OptimizeResult:
@@ -298,11 +315,20 @@ class GeneticAlgorithm:
             print(f"风机台数: {self.n_turbines}")
             print(f"种群大小: {pop_size}")
             print(f"最大代数: {max_gen}")
-            print(f"最小间距: {self.min_spacing:.1f} m "
-                  f"({self.config.min_spacing_multiple:.1f}倍转子直径)")
+            if self.spacing.directional:
+                print(
+                    f"间距约束: 方向性椭圆 "
+                    f"(参考风向 {self.spacing.reference_direction:.0f}°, "
+                    f"顺风 {self.spacing.downwind_multiple:g}D / "
+                    f"横风 {self.spacing.crosswind_multiple:g}D)"
+                )
+            else:
+                print(f"最小间距: {self.min_spacing:.1f} m "
+                      f"({self.config.min_spacing_multiple:.1f}倍转子直径)")
             print(f"场地面积: {self.boundary.area / 1e6:.2f} km²")
             print("=" * 35)
 
+        # 场地拥挤到无法生成任何可行个体时，在此有界退出。
         population = self._initialize_population(pop_size)
         fitness = self._evaluate_population(population)
 

@@ -78,6 +78,55 @@ print(f"   ✓ 合格布局检查: {valid}")
 valid, violations = check_min_spacing(bad_positions, min_space)
 print(f"   ✓ 违规布局检查: {valid}, 违规对数: {len(violations)}")
 
+print("\n5b. 测试方向性（椭圆）间距约束...")
+from wind_farm_opt.constraints.spacing import (
+    SpacingConstraint,
+    SpacingFeasibilityError,
+)
+d_pair = np.array([turb.rotor_diameter, turb.rotor_diameter])
+# 西风270°：顺风轴沿+x。顺风7D、横风3D。
+ell_constraint = SpacingConstraint(
+    d_pair,
+    directional=True,
+    reference_direction=270.0,
+    downwind_multiple=7.0,
+    crosswind_multiple=3.0,
+)
+a_along, b_cross = ell_constraint.representative_semiaxes()
+print(f"   ✓ 顺风半轴: {a_along:.1f} m, 横风半轴: {b_cross:.1f} m")
+
+# 横风4D：圆形5D会拒绝，椭圆接受。
+cross_pos = np.array([[0, 0], [0, 4 * turb.rotor_diameter]])
+valid, _ = ell_constraint.check(cross_pos)
+print(f"   ✓ 横风4D（圆形拒绝/椭圆接受）: {valid}")
+assert valid
+
+# 顺风6D：圆形5D接受，椭圆7D拒绝，并返回方向分量与所需净距。
+along_pos = np.array([[0, 0], [6 * turb.rotor_diameter, 0]])
+valid, ell_violations = ell_constraint.check(along_pos)
+v0 = ell_violations[0]
+print(
+    f"   ✓ 顺风6D违规: {not valid}, 顺风分量={v0.along_component:.0f} m, "
+    f"横风分量={v0.cross_component:.0f} m, 仍需净距={v0.required_clearance:.0f} m"
+)
+assert not valid and np.isclose(v0.required_clearance, turb.rotor_diameter)
+
+# 边界点与零距离定义一致。
+boundary_pt = np.array([[0, 0], [a_along, 0.0]])
+print(f"   ✓ 椭圆边界点可接受: {ell_constraint.check(boundary_pt)[0]}")
+zero_valid, zero_vios = ell_constraint.check(np.zeros((2, 2)))
+print(
+    f"   ✓ 零距离违规且所需净距有限: "
+    f"{(not zero_valid) and np.isfinite(zero_vios[0].required_clearance)}"
+)
+
+# 关闭新规则即退回径向圆域。
+radial_constraint = SpacingConstraint(
+    d_pair, directional=False, min_spacing_multiple=5.0
+)
+ra, rb = radial_constraint.representative_semiaxes()
+print(f"   ✓ 径向模式两轴等长: {np.isclose(ra, rb) and np.isclose(ra, min_space)}")
+
 print("\n6. 测试AEP计算（12台风机，50x50网格分辨率）...")
 from wind_farm_opt.farm.aep import AEPCalculator
 from wind_farm_opt.optimization.baseline import generate_grid_layout
@@ -138,6 +187,62 @@ print(f"   ✓ 最优净AEP: {opt_result.best_fitness:.2f} MWh")
 print(f"   ✓ 基线净AEP: {result.net_aep:.2f} MWh")
 improvement = (opt_result.best_fitness - result.net_aep) / result.net_aep * 100
 print(f"   ✓ 提升: {improvement:+.2f}%")
+
+print("\n7b. 测试方向性间距下的布局/优化与有界退出...")
+from wind_farm_opt.optimization.baseline import (
+    generate_grid_layout,
+    generate_staggered_grid_layout,
+)
+ell_full = SpacingConstraint(
+    rotor_diameters, directional=True, reference_direction=270.0,
+    downwind_multiple=7.0, crosswind_multiple=3.0,
+)
+ell_grid = generate_grid_layout(
+    boundary, n_turb, rotor_diameters, rng=np.random.default_rng(42),
+    spacing_constraint=ell_full,
+)
+print(f"   ✓ 方向性网格合规: {ell_full.check(ell_grid)[0]}")
+ell_stag = generate_staggered_grid_layout(
+    boundary, n_turb, rotor_diameters, rng=np.random.default_rng(42),
+    spacing_constraint=ell_full,
+)
+print(f"   ✓ 方向性交错布局合规: {ell_full.check(ell_stag)[0]}")
+
+ga_ell = GeneticAlgorithm(
+    n_turbines=n_turb,
+    rotor_diameters=rotor_diameters,
+    boundary=boundary,
+    fitness_fn=fitness_fn,
+    config=GAConfig(population_size=8, max_generations=3, seed=42),
+    spacing_constraint=ell_full,
+)
+ell_opt = ga_ell.optimize(verbose=False)
+print(f"   ✓ 方向性GA结果合规: {ell_full.check(ell_opt.best_positions)[0]}")
+
+# 固定种子可重复（方向性）。
+ga_ell2 = GeneticAlgorithm(
+    n_turbines=n_turb,
+    rotor_diameters=rotor_diameters,
+    boundary=boundary,
+    fitness_fn=fitness_fn,
+    config=GAConfig(population_size=8, max_generations=3, seed=42),
+    spacing_constraint=ell_full,
+)
+ell_opt2 = ga_ell2.optimize(verbose=False)
+print(f"   ✓ 固定种子可重复: {np.array_equal(ell_opt.best_positions, ell_opt2.best_positions)}")
+
+# 拥挤场地必须有界退出。
+tiny_boundary = create_rectangular_boundary(300, 300)
+bounded_exit = False
+try:
+    generate_grid_layout(
+        tiny_boundary, n_turb, rotor_diameters,
+        rng=np.random.default_rng(1), spacing_constraint=ell_full,
+    )
+except SpacingFeasibilityError:
+    bounded_exit = True
+print(f"   ✓ 拥挤场地方向性布局有界退出: {bounded_exit}")
+assert bounded_exit
 
 print("\n8. 测试经济性分析...")
 from wind_farm_opt.economy.costs import (

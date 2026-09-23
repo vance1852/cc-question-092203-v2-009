@@ -11,10 +11,11 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib import font_manager
-from matplotlib.patches import Polygon, Circle
+from matplotlib.patches import Polygon, Circle, Ellipse
 from matplotlib.colors import Normalize, LinearSegmentedColormap
 
 from ..constraints.boundary import SiteBoundary
+from ..constraints.spacing import SpacingConstraint
 from ..core.wind_resource import WindResource
 from ..farm.aep import FarmResult
 from ..optimization.ga import OptimizeResult
@@ -36,6 +37,44 @@ def set_chinese_font() -> None:
     plt.rcParams["axes.unicode_minus"] = False
 
 
+def _add_representative_safety_zone(
+    ax,
+    center: np.ndarray,
+    spacing: SpacingConstraint,
+) -> None:
+    """在指定机位上绘制一个代表性安全域（椭圆或圆）。"""
+    a, b = spacing.representative_semiaxes()
+    # Ellipse 的 width/height 为全轴长度，角度为相对 x 轴逆时针角度。
+    if spacing.directional:
+        zone = Ellipse(
+            center,
+            width=2.0 * a,
+            height=2.0 * b,
+            angle=spacing.ellipse_angle_deg,
+            facecolor="none",
+            edgecolor="red",
+            linewidth=1.8,
+            linestyle="--",
+            label=(
+                f"代表性安全域 (顺风 {spacing.downwind_multiple:g}D × "
+                f"横风 {spacing.crosswind_multiple:g}D)"
+            ),
+            zorder=5,
+        )
+    else:
+        zone = Circle(
+            center,
+            radius=a,
+            facecolor="none",
+            edgecolor="red",
+            linewidth=1.8,
+            linestyle="--",
+            label=f"代表性安全域 ({spacing.min_spacing_multiple:g}D)",
+            zorder=5,
+        )
+    ax.add_patch(zone)
+
+
 def plot_farm_layout(
     positions: np.ndarray,
     boundary: SiteBoundary,
@@ -46,6 +85,8 @@ def plot_farm_layout(
     title: str = "风电场机位布局",
     save_path: Optional[str] = None,
     show: bool = False,
+    spacing_constraint: Optional[SpacingConstraint] = None,
+    show_safety_zones: bool = False,
 ) -> None:
     """绘制风电场机位布局俯视图。
 
@@ -69,6 +110,10 @@ def plot_farm_layout(
         保存路径
     show : bool
         是否显示图表
+    spacing_constraint : Optional[SpacingConstraint]
+        间距约束，用于绘制代表性安全域
+    show_safety_zones : bool
+        是否在代表性机位（首台机组）上展示安全域
     """
     set_chinese_font()
 
@@ -124,6 +169,12 @@ def plot_farm_layout(
                     color="white",
                     fontweight="bold",
                 )
+
+    if show_safety_zones and spacing_constraint is not None and len(positions) > 0:
+        # 选取首台机组作为代表机位绘制安全域，避免 N 个域互相遮挡。
+        _add_representative_safety_zone(
+            ax, np.asarray(positions[0], dtype=np.float64), spacing_constraint
+        )
 
     if wake_interactions is not None:
         for (up_idx, down_idx), intensity in wake_interactions.items():

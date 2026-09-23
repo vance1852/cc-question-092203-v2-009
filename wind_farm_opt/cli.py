@@ -54,6 +54,8 @@ class WindFarmOptimizerCLI:
         self.rated_powers = np.array([t.rated_power for t in self.turbines])
         self.thrust_coefficients = np.array([t.thrust_coefficient for t in self.turbines])
 
+        self.spacing_constraint = config.create_spacing_constraint(self.rotor_diameters)
+
         self.aep_calc = AEPCalculator(
             turbines=self.turbines,
             wind_resource=self.wind_resource,
@@ -107,9 +109,11 @@ class WindFarmOptimizerCLI:
             rotor_diameters=self.rotor_diameters,
             min_multiple=self.config.optimization.min_spacing_multiple,
             rng=rng,
+            spacing_constraint=self.spacing_constraint,
         )
 
         print(f"已生成 {self.config.n_turbines} 台风机的网格布局")
+        print(f"间距口径: {self.spacing_constraint.describe()}")
 
         self.baseline_result = self.aep_calc.compute_farm_aep(self.baseline_positions)
         self._print_result_summary(self.baseline_result, "基线布局")
@@ -135,6 +139,7 @@ class WindFarmOptimizerCLI:
                 boundary=self.boundary,
                 fitness_fn=fit_fn,
                 config=ga_config,
+                spacing_constraint=self.spacing_constraint,
             )
         elif algo == "pso":
             pso_config = PSOConfig(
@@ -149,6 +154,7 @@ class WindFarmOptimizerCLI:
                 boundary=self.boundary,
                 fitness_fn=fit_fn,
                 config=pso_config,
+                spacing_constraint=self.spacing_constraint,
             )
         else:
             raise ValueError(f"未知的优化算法: {algo}")
@@ -243,6 +249,9 @@ class WindFarmOptimizerCLI:
 
         rng = np.random.default_rng(self.config.optimization.seed)
         original_n = self.config.n_turbines
+        original_turbines = self.turbines
+        original_diameters = self.rotor_diameters
+        original_powers = self.rated_powers
 
         turbine_cost = get_default_turbine_cost(self.config.turbine_model)
         farm_cost = get_default_farm_cost()
@@ -265,6 +274,9 @@ class WindFarmOptimizerCLI:
                 wake_model=self.wake_model,
                 wake_superposition=self.config.superposition_method,
             )
+            sweep_constraint = self.config.create_spacing_constraint(
+                self.rotor_diameters
+            )
 
             try:
                 positions = generate_grid_layout(
@@ -273,6 +285,7 @@ class WindFarmOptimizerCLI:
                     rotor_diameters=self.rotor_diameters,
                     min_multiple=self.config.optimization.min_spacing_multiple,
                     rng=rng,
+                    spacing_constraint=sweep_constraint,
                 )
 
                 result = self.aep_calc.compute_farm_aep(positions)
@@ -294,6 +307,15 @@ class WindFarmOptimizerCLI:
 
         self.sweep_results = sweep_data
         self.config.n_turbines = original_n
+        self.turbines = original_turbines
+        self.rotor_diameters = original_diameters
+        self.rated_powers = original_powers
+        self.aep_calc = AEPCalculator(
+            turbines=self.turbines,
+            wind_resource=self.wind_resource,
+            wake_model=self.wake_model,
+            wake_superposition=self.config.superposition_method,
+        )
 
     def run_visualization(self) -> None:
         """生成所有可视化图表。"""
@@ -324,6 +346,8 @@ class WindFarmOptimizerCLI:
                 title="基线网格布局 - 尾流损失分布",
                 save_path=os.path.join(save_dir, "baseline_layout.png") if save else None,
                 show=show,
+                spacing_constraint=self.spacing_constraint,
+                show_safety_zones=self.config.visualization.plot_safety_zones,
             )
 
             plot_turbine_loss_bar(
@@ -344,6 +368,8 @@ class WindFarmOptimizerCLI:
                 title="优化后布局 - 尾流损失分布",
                 save_path=os.path.join(save_dir, "optimized_layout.png") if save else None,
                 show=show,
+                spacing_constraint=self.spacing_constraint,
+                show_safety_zones=self.config.visualization.plot_safety_zones,
             )
 
             plot_turbine_loss_bar(
@@ -407,6 +433,10 @@ class WindFarmOptimizerCLI:
                 "turbine_model": self.config.turbine_model,
                 "wake_model": self.config.wake_model,
                 "min_spacing_multiple": self.config.optimization.min_spacing_multiple,
+                "directional_spacing": self.spacing_constraint.directional,
+                "spacing_reference_direction": self.spacing_constraint.reference_direction,
+                "downwind_spacing_multiple": self.spacing_constraint.downwind_multiple,
+                "crosswind_spacing_multiple": self.spacing_constraint.crosswind_multiple,
             },
             "site": {
                 "area_km2": float(self.boundary.area / 1e6),
@@ -622,7 +652,35 @@ def build_argparser() -> argparse.ArgumentParser:
         "--min-spacing",
         type=float,
         default=None,
-        help="最小间距倍数（转子直径倍数）",
+        help="最小间距倍数（转子直径倍数），径向模式",
+    )
+
+    parser.add_argument(
+        "--directional-spacing",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="启用/关闭方向性（椭圆）间距约束；不指定时沿用配置文件",
+    )
+
+    parser.add_argument(
+        "--spacing-direction",
+        type=float,
+        default=None,
+        help="方向性间距的参考风向（度，0=北、顺时针），如 270 表示西风",
+    )
+
+    parser.add_argument(
+        "--downwind-multiple",
+        type=float,
+        default=None,
+        help="顺风安全间距倍数（转子直径倍数），如 7",
+    )
+
+    parser.add_argument(
+        "--crosswind-multiple",
+        type=float,
+        default=None,
+        help="横风安全间距倍数（转子直径倍数），如 3",
     )
 
     parser.add_argument(
@@ -707,6 +765,12 @@ def build_argparser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--no-safety-zones",
+        action="store_true",
+        help="布局图中不绘制代表性安全域",
+    )
+
+    parser.add_argument(
         "--show-plots",
         action="store_true",
         help="显示图表窗口",
@@ -761,6 +825,14 @@ def main() -> int:
         config.boundary_params["height"] = args.height
     if args.min_spacing is not None:
         config.optimization.min_spacing_multiple = args.min_spacing
+    if args.directional_spacing is not None:
+        config.optimization.directional_spacing = args.directional_spacing
+    if args.spacing_direction is not None:
+        config.optimization.spacing_reference_direction = args.spacing_direction
+    if args.downwind_multiple is not None:
+        config.optimization.downwind_spacing_multiple = args.downwind_multiple
+    if args.crosswind_multiple is not None:
+        config.optimization.crosswind_spacing_multiple = args.crosswind_multiple
     if args.algorithm is not None:
         config.optimization.algorithm = args.algorithm
     if args.population is not None:
@@ -777,6 +849,8 @@ def main() -> int:
         config.visualization.save_dir = args.output_dir
     if args.no_plots:
         config.visualization.save_plots = False
+    if args.no_safety_zones:
+        config.visualization.plot_safety_zones = False
     if args.show_plots:
         config.visualization.show_plots = True
     if args.no_economic:

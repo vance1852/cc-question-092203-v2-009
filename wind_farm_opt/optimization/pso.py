@@ -7,9 +7,8 @@ import numpy as np
 
 from ..constraints.boundary import SiteBoundary
 from ..constraints.spacing import (
-    check_min_spacing,
-    compute_min_spacing_from_diameters,
-    enforce_min_spacing,
+    SpacingConstraint,
+    SpacingFeasibilityError,
 )
 
 
@@ -32,7 +31,8 @@ class PSOConfig:
     max_velocity : float
         最大速度（占场地范围的比例）
     min_spacing_multiple : float
-        最小间距倍数（相对于转子直径）
+        径向最小间距倍数；当优化器收到方向性 SpacingConstraint 时该值
+        不再参与判定
     penalty_factor : float
         约束违反惩罚因子
     seed : Optional[int]
@@ -60,6 +60,7 @@ class ParticleSwarmOptimizer:
         boundary: SiteBoundary,
         fitness_fn: Callable[[np.ndarray], float],
         config: Optional[PSOConfig] = None,
+        spacing_constraint: Optional[SpacingConstraint] = None,
     ) -> None:
         self.n_turbines = n_turbines
         self.rotor_diameters = np.asarray(rotor_diameters, dtype=np.float64)
@@ -69,10 +70,17 @@ class ParticleSwarmOptimizer:
 
         self.rng = np.random.default_rng(self.config.seed)
 
-        self.min_spacing = compute_min_spacing_from_diameters(
-            self.rotor_diameters,
-            self.config.min_spacing_multiple,
-        )
+        if spacing_constraint is not None:
+            self.spacing = spacing_constraint
+        else:
+            self.spacing = SpacingConstraint(
+                self.rotor_diameters,
+                directional=False,
+                min_spacing_multiple=self.config.min_spacing_multiple,
+            )
+
+        # 标量属性仅用于日志输出。
+        self.min_spacing = self.spacing.representative_semiaxes()[0]
 
         self.n_dim = n_turbines * 2
         self.x_range = boundary.x_max - boundary.x_min
@@ -113,7 +121,7 @@ class ParticleSwarmOptimizer:
         return positions, velocities
 
     def _generate_valid_layout(self) -> np.ndarray:
-        """生成一个满足约束的初始布局。"""
+        """生成一个满足约束的初始布局，失败时抛 SpacingFeasibilityError。"""
         max_attempts = 100
 
         for _ in range(max_attempts):
@@ -121,27 +129,42 @@ class ParticleSwarmOptimizer:
                 positions = self.boundary.sample_random_points(
                     self.n_turbines, self.rng, max_attempts=50
                 )
-                valid, _ = check_min_spacing(positions, self.min_spacing)
-                if valid:
-                    return positions
             except RuntimeError:
                 continue
+
+            valid, _ = self.spacing.check(positions)
+            if valid:
+                return positions
 
             try:
-                positions = self.boundary.sample_random_points(
-                    self.n_turbines, self.rng, max_attempts=50
+                return self.spacing.enforce(
+                    positions, self.boundary, self.rng
                 )
-                positions = enforce_min_spacing(
-                    positions, self.min_spacing, self.boundary, self.rng
-                )
-                return positions
-            except RuntimeError:
+            except SpacingFeasibilityError:
                 continue
 
-        raise RuntimeError("无法生成满足约束的初始布局")
+        raise SpacingFeasibilityError("无法生成满足间距约束的初始布局")
+
+    def _repair_layout(self, positions: np.ndarray) -> np.ndarray:
+        """把粒子位置修复为可行布局；修复失败则重新生成，仍失败则有界退出。"""
+        positions = positions.copy()
+
+        for i in range(self.n_turbines):
+            if not self.boundary.contains_point(positions[i]):
+                positions[i] = self.boundary.project_to_boundary(positions[i])
+
+        valid, _ = self.spacing.check(positions)
+        inside = self.boundary.contains_all(positions).all()
+        if valid and inside:
+            return positions
+
+        try:
+            return self.spacing.enforce(positions, self.boundary, self.rng)
+        except SpacingFeasibilityError:
+            return self._generate_valid_layout()
 
     def _compute_penalty(self, positions_flat: np.ndarray) -> float:
-        """计算约束违反惩罚。"""
+        """计算约束违反惩罚（防御性；正常流程中粒子均已被修复为可行）。"""
         positions = positions_flat.reshape(self.n_turbines, 2)
 
         penalty = 0.0
@@ -151,11 +174,10 @@ class ParticleSwarmOptimizer:
             n_violations = np.sum(~inside)
             penalty += n_violations * self.config.penalty_factor
 
-        valid, violations = check_min_spacing(positions, self.min_spacing)
+        valid, violations = self.spacing.check(positions)
         if not valid:
-            for i, j in violations:
-                dist = np.linalg.norm(positions[i] - positions[j])
-                penalty += (self.min_spacing - dist) * self.config.penalty_factor
+            for v in violations:
+                penalty += (1.0 - v.normalized_ratio) * self.config.penalty_factor
 
         return penalty
 
@@ -179,24 +201,9 @@ class ParticleSwarmOptimizer:
         return fitness
 
     def _repair(self, positions_flat: np.ndarray) -> np.ndarray:
-        """修复违反约束的粒子。"""
+        """修复违反约束的粒子（成功后保证可行，否则抛 SpacingFeasibilityError）。"""
         positions = positions_flat.reshape(self.n_turbines, 2)
-
-        for i in range(self.n_turbines):
-            if not self.boundary.contains_point(positions[i]):
-                positions[i] = self.boundary.project_to_boundary(positions[i])
-
-        valid, _ = check_min_spacing(positions, self.min_spacing)
-        inside = self.boundary.contains_all(positions).all()
-
-        if not (valid and inside):
-            try:
-                positions = enforce_min_spacing(
-                    positions, self.min_spacing, self.boundary, self.rng
-                )
-            except RuntimeError:
-                pass
-
+        positions = self._repair_layout(positions)
         return positions.flatten()
 
     def optimize(self, verbose: bool = True) -> "OptimizeResult":
@@ -221,11 +228,20 @@ class ParticleSwarmOptimizer:
             print(f"风机台数: {self.n_turbines}")
             print(f"粒子群大小: {swarm_size}")
             print(f"最大迭代: {max_iter}")
-            print(f"最小间距: {self.min_spacing:.1f} m "
-                  f"({self.config.min_spacing_multiple:.1f}倍转子直径)")
+            if self.spacing.directional:
+                print(
+                    f"间距约束: 方向性椭圆 "
+                    f"(参考风向 {self.spacing.reference_direction:.0f}°, "
+                    f"顺风 {self.spacing.downwind_multiple:g}D / "
+                    f"横风 {self.spacing.crosswind_multiple:g}D)"
+                )
+            else:
+                print(f"最小间距: {self.min_spacing:.1f} m "
+                      f"({self.config.min_spacing_multiple:.1f}倍转子直径)")
             print(f"w={w}, c1={c1}, c2={c2}")
             print("=" * 35)
 
+        # 场地拥挤到无法生成任何可行粒子时，在此有界退出。
         positions, velocities = self._initialize_swarm(swarm_size)
         fitness = self._evaluate_particles(positions)
 
